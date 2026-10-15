@@ -1,0 +1,689 @@
+#!/usr/bin/env python3
+#        _
+# __   _(_)_ __
+# \ \ / / | '_ \
+#  \ V /| | |_) |
+#   \_/ |_| .__/
+#         |_|
+#
+# F. P. Laussy -- https://github.com/laussy/vip
+# v1.0.0 Thu 15 Oct 2026 - first version: the tree of the most important
+#                          works citing a paper, generation after generation,
+#                          from OpenAlex; text, JSON, Graphviz, wiki, keys.
+"""
+vip -- very important papers: from one paper, the tree of the most important
+works that cite it, of the most important works that cite those, and so on.
+
+Usage:
+    vip PAPER [options]
+
+PAPER is a DOI, an arXiv id, an OpenAlex id (W...), or a key of the --bib
+files, as for citing (https://github.com/laussy/citing, which vip needs).
+
+How the tree grows: the works citing the paper are read from OpenAlex, ranked,
+and the best N are kept; each of them is treated in the same way, down to the
+given depth. A work is shown once, at its first place in the tree; when it is
+again among the best citers of another work, a "see [n]" line says so. All
+counts come from OpenAlex, so that they can be compared with one another.
+
+Truncation:
+    -d, --depth D         generations below the paper (default 2)
+    -n, --top N[,N2,...]  works kept under each work; a list gives one number
+                          per generation, and the depth is then its length
+                          unless -d says otherwise (default 5)
+    -r, --rank BY         rate: citations per year since publication (default)
+                          recent: citations in this year and the two before
+                          cites: all citations
+        --min-cites N     leave out works cited fewer than N times
+        --since YEAR      leave out works published before YEAR
+        --until YEAR      leave out works published after YEAR
+        --type TYPES      only these OpenAlex types, comma-separated (review,
+                          article, preprint, book-chapter, ...). By default all
+                          but erratum, paratext and retraction
+        --topic WORDS     only works with WORDS in their title or abstract
+                          (an OpenAlex search: it costs more of the budget)
+        --no-self         leave out works sharing an author with the work
+                          they are placed under
+        --max N           stop when the tree holds N works (default 300)
+        --pool N          citing works read per work before ranking: the N
+                          most cited, plus, unless --rank cites, the N most
+                          cited of the last five years (default 200)
+
+Output:
+    -b, --bib FILES       BibTeX file(s), comma-separated: works get their key
+    -f, --format FMT      text (default), json, dot (Graphviz), wiki (nested
+                          list of {{key}}), keys (bib keys, one per line), ids
+                          (DOI or arXiv:ID of works with no key)
+    -o, --output FILE     write there instead of stdout; a .svg, .pdf or .png
+                          is drawn by Graphviz's dot from the dot format
+        --no-links        no "see [n]" lines, and in the drawing only the
+                          tree's own edges
+    -W, --width N         cut text lines at N characters (default: the
+                          terminal's width; lines are not cut when piped)
+        --fresh           do not use the cache (~/.cache/vip, answers younger
+                          than 7 days are reused)
+        --mailto EMAIL    contact for the OpenAlex polite pool (or env
+                          VIP_MAILTO); nothing is sent without it
+        --openalex-key K  OpenAlex API key (or env OPENALEX_API_KEY)
+    -q, --quiet           no progress or summary on stderr
+    -V, --version         the version
+    -h, --help            this message
+
+Text columns: [n] number in the tree, year, citations, the ranking figure
+(per year, or recent), marks (R review, P preprint, * shares an author with
+the work above it), then the bib key (or the DOI), first author and title.
+
+Defaults: ~/.viprc (or the file named by env VIP_RC) holds options as on the
+command line; --bib, --mailto and --openalex-key are also taken from
+~/.citingrc when ~/.viprc does not give them.
+"""
+
+import datetime
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+__version__ = '1.0.0'
+
+NEEDS_CITING = (2, 0, 0)
+
+
+def load_citing():
+    """citing's functions: from the file next to vip, on the PATH, or in a
+    sibling checkout."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    for p in (os.path.join(here, 'citing'), shutil.which('citing'), os.path.join(here, '..', 'citing', 'citing')):
+        if p and os.path.isfile(p):
+            loader = importlib.machinery.SourceFileLoader('citing', p)
+            spec = importlib.util.spec_from_loader('citing', loader)
+            m = importlib.util.module_from_spec(spec)
+            loader.exec_module(m)
+            if tuple(int(x) for x in m.__version__.split('.')) < NEEDS_CITING:
+                sys.exit('vip: needs citing %s or later, %s has %s' % ('.'.join(map(str, NEEDS_CITING)), p, m.__version__))
+            return m
+    sys.exit('vip: needs citing (https://github.com/laussy/citing) next to it or on the PATH')
+
+
+C = load_citing()
+say = C.say
+
+TODAY = datetime.date.today()
+CACHE = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), 'vip')
+CACHE_DAYS = 7
+FRESH = False
+STATS = {'cached': 0}
+SEL = ('id,doi,title,publication_year,publication_date,cited_by_count,counts_by_year,'
+       'authorships,primary_location,type,ids,referenced_works')
+
+
+# --------------------------------------------------------------------------
+# OpenAlex, with a cache
+# --------------------------------------------------------------------------
+def oa_query(params):
+    """A /works query; answers younger than CACHE_DAYS come from the cache."""
+    key = hashlib.sha1(json.dumps(params, sort_keys=True).encode()).hexdigest()
+    path = os.path.join(CACHE, key + '.json')
+    if not FRESH:
+        try:
+            if time.time() - os.path.getmtime(path) < CACHE_DAYS * 86400:
+                with open(path, encoding='utf-8') as fh:
+                    STATS['cached'] += 1
+                    return json.load(fh)
+        except (OSError, ValueError):
+            pass
+    p = dict(params)
+    if C.MAILTO:
+        p['mailto'] = C.MAILTO
+    d = C.get('https://api.openalex.org/works', p)
+    if d is not None:
+        try:
+            os.makedirs(CACHE, exist_ok=True)
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(d, fh)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+    return d
+
+
+def short(wid):
+    return (wid or '').rsplit('/', 1)[-1]
+
+
+TEX_ACC = {"'": '\u0301', '`': '\u0300', '^': '\u0302', '"': '\u0308', '~': '\u0303', '=': '\u0304',
+           '.': '\u0307', 'u': '\u0306', 'v': '\u030c', 'H': '\u030b', 'c': '\u0327', 'k': '\u0328',
+           'r': '\u030a', 'd': '\u0323', 'b': '\u0331'}
+TEX_SYM = {'ss': '\u00df', 'o': '\u00f8', 'O': '\u00d8', 'l': '\u0142', 'L': '\u0141', 'aa': '\u00e5',
+           'AA': '\u00c5', 'ae': '\u00e6', 'AE': '\u00c6', 'oe': '\u0153', 'OE': '\u0152', 'i': '\u0131'}
+
+
+def tex2uni(s):
+    """BibTeX accents to Unicode, braces off: {S\\'anchez Mu\\~noz} -> Sánchez Muñoz."""
+    import unicodedata
+    s = re.sub(r'\\([`\'^"~=.]|[uvHckrdb](?=[\s{]))\s*\{?\\?([a-zA-Z])\}?',
+               lambda m: m.group(2) + TEX_ACC[m.group(1)], s or '')
+    s = re.sub(r'\\(ss|aa|AA|ae|AE|oe|OE|o|O|l|L|i)\b\s*', lambda m: TEX_SYM[m.group(1)], s)
+    s = s.replace('{', '').replace('}', '').replace('~', ' ')
+    return unicodedata.normalize('NFC', ' '.join(s.split()))
+
+
+def bib_surname(name):
+    """The surname of a BibTeX author, in Unicode; a braced group is one surname."""
+    m = re.search(r'\{((?:[^{}]|\{[^{}]*\})*\s(?:[^{}]|\{[^{}]*\})*)\}\s*$', name)
+    if m:
+        return tex2uni(m.group(1))
+    name = tex2uni(name)
+    if ',' in name:
+        return name.split(',')[0].strip()
+    parts = name.split()
+    # BibTeX's "von" part: lowercase words before the last name (del Valle)
+    for i in range(1, len(parts) - 1):
+        if parts[i][:1].islower():
+            return ' '.join(parts[i:])
+    return parts[-1] if parts else '?'
+
+
+class Work:
+    """An OpenAlex work, with what the tree needs."""
+
+    def __init__(self, x):
+        self.wid = short(x['id'])
+        self.doi = C.ndoi(x.get('doi'))
+        self.arxiv = C.arxiv_of_doi(self.doi)
+        loc = x.get('primary_location') or {}
+        lp = loc.get('landing_page_url') or ''
+        if not self.arxiv and 'arxiv.org/abs/' in lp:
+            self.arxiv = C.narxiv(lp.split('/abs/')[-1])
+        self.title = ' '.join((x.get('title') or '').split()) or None
+        self.year = x.get('publication_year')
+        self.date = x.get('publication_date')
+        self.cites = x.get('cited_by_count') or 0
+        self.by_year = {c['year']: c['cited_by_count'] for c in x.get('counts_by_year') or []}
+        self.authors = [a['author'].get('display_name') or '' for a in x.get('authorships') or []]
+        self.author_ids = {a['author'].get('id') for a in x.get('authorships') or [] if a['author'].get('id')}
+        self.venue = (loc.get('source') or {}).get('display_name')
+        self.type = x.get('type')
+        self.refs = {short(r) for r in x.get('referenced_works') or []}
+        self.nt = C.ntitle(self.title)
+        self.key = None
+        self.children = []
+        self.links = []          # works already in the tree, among the best citers
+        self.parent = None
+        self.depth = 0
+        self.self_cite = False
+        self.n = None
+
+    @property
+    def rate(self):
+        try:
+            d = datetime.date.fromisoformat(self.date)
+        except (TypeError, ValueError):
+            d = datetime.date(self.year or TODAY.year, 7, 1)
+        age = max((TODAY - d).days / 365.25, 1.0)
+        return self.cites / age
+
+    @property
+    def recent(self):
+        return sum(c for y, c in self.by_year.items() if y >= TODAY.year - 2)
+
+    def ident(self):
+        if self.key:
+            return self.key
+        if self.arxiv:
+            return 'arXiv:' + self.arxiv
+        return self.doi or self.wid
+
+    def set_key(self, bib, key=None):
+        self.key = key or (bib.match(self.as_rec()) or [None])[0]
+        if self.key and bib.authors.get(self.key):
+            self.bib_first = re.split(r'\s+and\s+', bib.authors[self.key])[0]
+
+    def first(self):
+        if getattr(self, 'bib_first', None):
+            return bib_surname(self.bib_first)
+        return C.surname(self.authors[0]) if self.authors else '?'
+
+    def as_rec(self):
+        r = C.Rec()
+        if self.doi:
+            C.add_doi(r, self.doi)
+        if self.arxiv:
+            r.arxiv.add(self.arxiv)
+        r.title = self.title
+        return r
+
+
+# --------------------------------------------------------------------------
+# The tree
+# --------------------------------------------------------------------------
+def filters(o, wid, recent_only=False):
+    f = ['cites:' + wid]
+    if o['type']:
+        f.append('type:' + '|'.join(o['type']))
+    else:
+        f += ['type:!erratum', 'type:!paratext', 'type:!retraction']
+    since = o['since']
+    if recent_only:
+        since = max(since or 0, TODAY.year - 4)
+    if since:
+        f.append('from_publication_date:%d-01-01' % since)
+    if o['until']:
+        f.append('to_publication_date:%d-12-31' % o['until'])
+    if o['min_cites']:
+        f.append('cited_by_count:>%d' % (o['min_cites'] - 1))
+    if o['topic']:
+        f.append('title_and_abstract.search:' + o['topic'].replace(',', ' '))
+    return ','.join(f)
+
+
+def citers(o, wid):
+    """The pool of works citing wid: the most cited, and (unless ranking by
+    all citations) the most cited of the last five years."""
+    out, total = {}, 0
+    for recent in ((False, True) if o['rank'] != 'cites' else (False,)):
+        got, page = 0, 1
+        while got < o['pool']:
+            per = min(200, o['pool'] - got)
+            d = oa_query({'filter': filters(o, wid, recent), 'sort': 'cited_by_count:desc',
+                          'per-page': per, 'page': page, 'select': SEL})
+            if not d:
+                break
+            if not recent and page == 1:
+                total = d['meta']['count']
+            for x in d['results']:
+                out.setdefault(short(x['id']), x)
+            got += len(d['results'])
+            if len(d['results']) < per:
+                break
+            page += 1
+        if not recent and got >= total:
+            break            # the whole list is in already
+    return [Work(x) for x in out.values()], total
+
+
+def dedupe(works):
+    """A preprint and its published version can both cite: keep one, the
+    published one (or the more cited)."""
+    best = {}
+    for w in works:
+        k = w.nt if len(w.nt) >= 20 else w.wid
+        b = best.get(k)
+        if b is None or ((b.type == 'preprint', -b.cites) > (w.type == 'preprint', -w.cites)):
+            best[k] = w
+    return list(best.values())
+
+
+def score(o, w):
+    return {'rate': w.rate, 'recent': w.recent, 'cites': w.cites}[o['rank']]
+
+
+def grow(o, seed, bib=None):
+    placed = {seed.wid: seed}
+    titles = {seed.nt: seed} if len(seed.nt) >= 20 else {}
+    level, depth = [seed], 0
+    count = 1
+    while level and depth < o['depth'] and count < o['max']:
+        nxt = []
+        top = o['top'][min(depth, len(o['top']) - 1)]
+        for node in level:
+            if count >= o['max']:
+                break
+            pool, total = citers(o, node.wid)
+            node.total = total
+            pool = sorted(dedupe(pool), key=lambda w: (-score(o, w), -w.cites, w.wid))
+            for w in pool:
+                if len(node.children) >= top or count >= o['max']:
+                    break
+                w.self_cite = bool(w.author_ids & node.author_ids)
+                if w.self_cite and o['no_self']:
+                    continue
+                there = placed.get(w.wid) or (titles.get(w.nt) if len(w.nt) >= 20 else None)
+                if there is not None:
+                    if there is not node and there is not seed and there not in node.links:
+                        node.links.append(there)
+                    continue
+                w.parent, w.depth = node, depth + 1
+                if bib:
+                    w.set_key(bib)
+                node.children.append(w)
+                placed[w.wid] = w
+                if len(w.nt) >= 20:
+                    titles[w.nt] = w
+                count += 1
+                nxt.append(w)
+            say('  [gen %d] %-24s %5d citers, %d kept' % (depth + 1, node.ident()[:24], total, len(node.children)))
+        level, depth = nxt, depth + 1
+    return placed
+
+
+def walk(node):
+    yield node
+    for c in node.children:
+        yield from walk(c)
+
+
+def number(seed):
+    for i, w in enumerate(walk(seed)):
+        w.n = i
+
+
+def edges(seed):
+    """Every citation between works of the tree: (citing, cited, in_tree)."""
+    nodes = list(walk(seed))
+    by = {w.wid: w for w in nodes}
+    out = []
+    for w in nodes:
+        for r in sorted(w.refs):
+            if r in by and by[r] is not w:
+                out.append((w, by[r], w.parent is by[r]))
+        if w.parent is not None and w.parent.wid not in w.refs:
+            out.append((w, w.parent, True))   # the tree edge, from the cites: filter
+    return out
+
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+def marks(w):
+    return ('R' if w.type == 'review' else 'P' if w.type == 'preprint' else ' ') + ('*' if w.self_cite else ' ')
+
+
+def fig(o, w):
+    r = ('%5.1f' if w.rate < 999.95 else '%5.0f') % w.rate
+    return {'rate': r, 'recent': '%5d' % w.recent, 'cites': '     '}[o['rank']]
+
+
+def text(o, seed, width):
+    head = {'rate': '/yr', 'recent': '3 yrs', 'cites': ''}[o['rank']]
+    lines = ['%5s %4s %6s %5s' % ('[n]', 'year', 'cites', head)]
+    pad = ' ' * 27
+
+    def cut(s):
+        return s if not width or len(s) <= width else s[:width - 1] + '…'
+
+    def rec(w, prefix, last, root):
+        branch = '' if root else (prefix + ('└─ ' if last else '├─ '))
+        lines.append(cut('%5s %4s %6d %5s %2s %s%s  %s  %s' % (
+            '[%d]' % w.n, w.year or '????', w.cites, fig(o, w), marks(w), branch,
+            w.ident(), w.first(), w.title or '')))
+        sub = '' if root else prefix + ('   ' if last else '│  ')
+        items = [('c', c) for c in w.children] + ([('l', l) for l in w.links] if not o['no_links'] else [])
+        for i, (kind, c) in enumerate(items):
+            end = i == len(items) - 1
+            if kind == 'c':
+                rec(c, sub, end, False)
+            else:
+                lines.append(cut(pad + sub + ('└─ ' if end else '├─ ') + 'see [%d] %s' % (c.n, c.ident())))
+
+    rec(seed, '', True, True)
+    return '\n'.join(lines) + '\n'
+
+
+def esc(s):
+    return (s or '').replace('\\', '\\\\').replace('"', '\\"')
+
+
+def wrap(s, n=30, lines=2):
+    words, out, cur = (s or '').split(), [], ''
+    for wd in words:
+        if cur and len(cur) + 1 + len(wd) > n:
+            out.append(cur)
+            cur = wd
+            if len(out) == lines:
+                break
+        else:
+            cur = (cur + ' ' + wd).strip()
+    else:
+        if cur:
+            out.append(cur)
+    if len(out) == lines and ' '.join(out) != ' '.join(words):
+        out[-1] = out[-1].rstrip('.,;:') + '…'
+    return out
+
+
+def dot(o, seed, desc):
+    nodes = list(walk(seed))
+    years = sorted({w.year for w in nodes if w.year})
+    L = ['digraph vip {',
+         '  graph [rankdir=TB, ranksep=0.35, nodesep=0.18, fontname="Helvetica", fontsize=12, '
+         'labelloc=t, label="%s"];' % esc(desc),
+         '  node [shape=box, style="rounded,filled", fillcolor="#ffffff", color="#555555", '
+         'fontname="Helvetica", fontsize=9, margin="0.08,0.04"];',
+         '  edge [color="#444444", arrowsize=0.55];']
+    if years:
+        # the years that have works, a run of empty years shrunk to one row
+        axis = []
+        for y in years:
+            if axis and y - axis[-1][0] > 2:
+                axis.append((axis[-1][0] + 1, '\u22ee'))
+            elif axis and y - axis[-1][0] == 2:
+                axis.append((y - 1, str(y - 1)))
+            axis.append((y, str(y)))
+        L.append('  { node [shape=plaintext, style="", fontsize=11, fontcolor="#777777"];')
+        L.append('    ' + ' -> '.join('y%d' % y for y, _ in axis) + ' [style=invis]; }')
+        for y, lab in axis:
+            L.append('  y%d [label="%s"];' % (y, lab))
+    for y in years:
+        L.append('  { rank=same; y%d; %s }' % (y, ' '.join('n%d;' % w.n for w in nodes if w.year == y)))
+    for w in nodes:
+        lab = ['%s %s' % (w.first(), w.year or '')] + wrap(w.title)
+        lab.append('%s · %d cit.' % (w.key, w.cites) if w.key else '%d cit.' % w.cites)
+        attrs = ['label="%s"' % esc('\n'.join(lab))]
+        if w is seed:
+            attrs += ['fillcolor="#c9dcf0"', 'penwidth=2']
+        elif w.key:
+            attrs.append('fillcolor="#e6eff8"')
+        if w.type == 'review':
+            attrs += ['peripheries=2']
+        if w.doi:
+            attrs.append('URL="https://doi.org/%s"' % esc(w.doi))
+        attrs.append('tooltip="%s"' % esc('[%d] %s' % (w.n, w.title or '')))
+        L.append('  n%d [%s];' % (w.n, ', '.join(attrs)))
+    for a, b, tree in edges(seed):
+        # drawn from the cited work to the citing one: time runs down the page
+        if tree:
+            L.append('  n%d -> n%d;' % (b.n, a.n))
+        elif not o['no_links']:
+            L.append('  n%d -> n%d [style=dashed, color="#bbbbbb", penwidth=0.7, arrowsize=0.4, '
+                     'constraint=false];' % (b.n, a.n))
+    L.append('}')
+    return '\n'.join(L) + '\n'
+
+
+def wiki(o, seed):
+    out = []
+    for w in walk(seed):
+        stars = '*' * (w.depth + 1)
+        if w.key:
+            out.append('%s {{%s}}' % (stars, w.key))
+        else:
+            url = 'https://doi.org/' + w.doi if w.doi and not w.arxiv else (
+                'https://arxiv.org/abs/' + w.arxiv if w.arxiv else 'https://openalex.org/' + w.wid)
+            who = w.first() + (" ''et al.''" if len(w.authors) > 1 else '')
+            out.append("%s [%s %s], %s, ''%s'' (%s)" % (stars, url, (w.title or '').replace(']', '&#93;'),
+                                                       who, w.venue or w.type or '', w.year or ''))
+    return '\n'.join(out) + '\n'
+
+
+def as_json(o, seed, desc):
+    nodes = list(walk(seed))
+    return json.dumps({
+        'vip': __version__, 'date': TODAY.isoformat(), 'title': desc,
+        'options': {k: o[k] for k in ('depth', 'top', 'rank', 'min_cites', 'since', 'until', 'type',
+                                      'topic', 'no_self', 'max', 'pool')},
+        'works': [{'n': w.n, 'depth': w.depth, 'parent': w.parent.n if w.parent else None,
+                   'openalex': w.wid, 'doi': w.doi, 'arxiv': w.arxiv, 'key': w.key, 'year': w.year,
+                   'date': w.date, 'title': w.title, 'authors': w.authors, 'venue': w.venue,
+                   'type': w.type, 'cites': w.cites, 'rate': round(w.rate, 2), 'recent': w.recent,
+                   'self_citation': w.self_cite, 'citers_total': getattr(w, 'total', None),
+                   'see': [l.n for l in w.links]} for w in nodes],
+        'citations': [{'citing': a.n, 'cited': b.n, 'tree': t} for a, b, t in edges(seed)],
+    }, indent=1, ensure_ascii=False) + '\n'
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+TAKES = {'-d': 'depth', '--depth': 'depth', '-n': 'top', '--top': 'top', '-r': 'rank', '--rank': 'rank',
+         '--min-cites': 'min_cites', '--since': 'since', '--until': 'until', '--type': 'type',
+         '--topic': 'topic', '--max': 'max', '--pool': 'pool', '-b': 'bib', '--bib': 'bib',
+         '-f': 'format', '--format': 'format', '-o': 'output', '--output': 'output',
+         '-W': 'width', '--width': 'width', '--mailto': 'mailto', '--openalex-key': 'openalex_key'}
+FLAGS = {'--no-self': 'no_self', '--no-links': 'no_links', '--fresh': 'fresh', '-q': 'quiet', '--quiet': 'quiet'}
+
+
+def parse_args(argv):
+    o = {'depth': None, 'top': ['5'], 'rank': 'rate', 'min_cites': 0, 'since': None, 'until': None,
+         'type': [], 'topic': None, 'no_self': False, 'max': 300, 'pool': 200, 'bib': [],
+         'format': None, 'output': None, 'width': None, 'no_links': False, 'fresh': False,
+         'mailto': os.environ.get('VIP_MAILTO'), 'openalex_key': os.environ.get('OPENALEX_API_KEY'),
+         'quiet': False}
+    for a in argv:
+        if a in ('-h', '--help'):
+            print(__doc__.strip())
+            sys.exit(0)
+        if a in ('-V', '--version'):
+            print('vip', __version__, '(citing %s)' % C.__version__)
+            sys.exit(0)
+    lists = {'bib': 'split', 'type': 'split', 'top': 'split'}
+    ints = ('depth', 'min_cites', 'since', 'until', 'max', 'pool', 'width')
+    pos = []
+    given = C.parse_options(argv, o, TAKES, FLAGS, lists, ints, 'vip', pos)
+    rc = dict(o)
+    for k in lists:
+        rc[k] = []
+    rc_given = C.parse_options(C.read_rc('VIP_RC', 'vip'), rc, TAKES, FLAGS, lists, ints, 'vip (~/.viprc)', None)
+    for k in rc_given - given:
+        o[k] = rc[k]
+    # what ~/.citingrc says of the bibliography and of OpenAlex
+    crc = {}
+    try:
+        cg = C.parse_options(C.read_rc('CITING_RC', 'citing'), crc, C.TAKES, C.FLAGS,
+                             {'bib': 'split', 'own': 'split', 'hunt': 'raw'}, ('since', 'hunt_since', 'hunt_max'),
+                             'vip (~/.citingrc)', None)
+    except SystemExit:
+        cg = set()
+    for k in ('bib', 'mailto', 'openalex_key'):
+        if k in cg and k not in given | rc_given:
+            o[k] = crc[k]
+    if not pos:
+        print(__doc__.strip())
+        sys.exit(1)
+    if len(pos) > 1:
+        sys.exit('vip: one paper at a time')
+    o['paper'] = pos[0]
+    try:
+        o['top'] = [int(x) for x in o['top']]
+    except ValueError:
+        sys.exit('vip: --top takes numbers, e.g. 5 or 10,5,3')
+    if any(t < 1 for t in o['top']):
+        sys.exit('vip: --top numbers must be 1 or more')
+    if o['depth'] is None:
+        o['depth'] = len(o['top']) if 'top' in given | rc_given and len(o['top']) > 1 else 2
+    if o['rank'] not in ('rate', 'recent', 'cites'):
+        sys.exit('vip: --rank is rate, recent or cites')
+    ext = os.path.splitext(o['output'] or '')[1].lower().lstrip('.')
+    if o['format'] is None:
+        o['format'] = {'json': 'json', 'dot': 'dot', 'gv': 'dot', 'svg': 'dot', 'pdf': 'dot', 'png': 'dot',
+                       'wiki': 'wiki', 'txt': 'text'}.get(ext, 'text')
+    if o['format'] not in ('text', 'json', 'dot', 'wiki', 'keys', 'ids'):
+        sys.exit('vip: --format is text, json, dot, wiki, keys or ids')
+    if ext in ('svg', 'pdf', 'png') and o['format'] != 'dot':
+        sys.exit('vip: a .%s is drawn from the dot format' % ext)
+    o['render'] = ext if ext in ('svg', 'pdf', 'png') else None
+    return o
+
+
+def main(argv):
+    global FRESH
+    o = parse_args(argv)
+    C.QUIET, C.MAILTO, C.OPENALEX_KEY = o['quiet'], o['mailto'], o['openalex_key']
+    FRESH = o['fresh']
+    if o['render'] and not shutil.which('dot'):
+        sys.exit('vip: drawing a .%s needs Graphviz (dot); -f dot writes the source' % o['render'])
+
+    bib = C.Bib(o['bib']) if o['bib'] else None
+    s = C.resolve(o['paper'], bib, prog='vip')
+    ident = s['wid'] or 'doi:' + s['doi']
+    x = C.openalex_work(ident, select=SEL)
+    if not x:
+        sys.exit('vip: OpenAlex has no work for %s' % C.label(s))
+    seed = Work(x)
+    if bib:
+        seed.set_key(bib, s['key'])
+
+    by = {'rate': 'citations per year', 'recent': 'citations in %d–%d' % (TODAY.year - 2, TODAY.year),
+          'cites': 'citations'}[o['rank']]
+    tops = ','.join(map(str, o['top']))
+    only = [x for x in (
+        o['topic'] and 'on "%s"' % o['topic'],
+        o['type'] and 'type %s' % '|'.join(o['type']),
+        o['since'] and 'from %d' % o['since'],
+        o['until'] and 'to %d' % o['until'],
+        o['min_cites'] and 'cited %d+ times' % o['min_cites'],
+        o['no_self'] and 'no self-citations') if x]
+    desc = '%s (%s %s): %d generation%s, top %s by %s%s, OpenAlex %s' % (
+        seed.ident(), seed.first(), seed.year or '', o['depth'], 's' if o['depth'] > 1 else '', tops, by,
+        ' (%s)' % ', '.join(only) if only else '', '%d %s' % (TODAY.day, TODAY.strftime('%b %Y')))
+    say('vip %s: %s' % (__version__, desc))
+    grow(o, seed, bib)
+    number(seed)
+    nodes = list(walk(seed))
+
+    f = o['format']
+    width = None
+    if f == 'text':
+        if o['width']:
+            width = o['width']
+        elif not o['output'] and sys.stdout.isatty():
+            width = shutil.get_terminal_size((160, 40)).columns
+        out = text(o, seed, width)
+    elif f == 'json':
+        out = as_json(o, seed, desc)
+    elif f == 'dot':
+        out = dot(o, seed, desc)
+    elif f == 'wiki':
+        out = wiki(o, seed)
+    elif f == 'keys':
+        out = ''.join(w.key + '\n' for w in nodes if w.key)
+    else:
+        out = ''.join(w.ident() + '\n' for w in nodes if not w.key and (w.doi or w.arxiv))
+
+    if o['render']:
+        r = subprocess.run(['dot', '-T' + o['render'], '-o', o['output']], input=out.encode(), capture_output=True)
+        if r.returncode:
+            sys.exit('vip: dot failed: ' + r.stderr.decode(errors='replace').strip())
+    elif o['output']:
+        with open(o['output'], 'w', encoding='utf-8') as fh:
+            fh.write(out)
+    else:
+        sys.stdout.write(out)
+
+    links = sum(len(w.links) for w in nodes)
+    inbib = sum(bool(w.key) for w in nodes)
+    left = (C.BUDGET.get('api.openalex.org') or {}).get('x-ratelimit-remaining')
+    gens = max(w.depth for w in nodes)
+    say('%d works in %d generation%s%s%s; OpenAlex: %d queries, %d from the cache%s%s' % (
+        len(nodes), gens, '' if gens == 1 else 's',
+        ', %d seen again ("see")' % links if links else '',
+        ', %d in the bib files' % inbib if bib else '',
+        C.CALLS.get('api.openalex.org', 0), STATS['cached'],
+        ', %s credits left today' % left if left else '',
+        '; written to ' + o['output'] if o['output'] else ''))
+
+
+if __name__ == '__main__':
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        pass
